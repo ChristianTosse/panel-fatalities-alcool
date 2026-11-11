@@ -1,0 +1,412 @@
+---
+title: "Les taxes sur la bière réduisent-elles la mortalité routière ?"
+subtitle: "Projet complet de données de panel : 48 États américains, 1982-1988 (jeu de données Fatalities)"
+author: "Christian TOSSE — M2 Mathématiques des Données"
+date: "Novembre 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    css: style.css
+    pandoc_args: ["--lua-filter=boxes.lua"]
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    highlight: tango
+    includes:
+      in_header: header.tex
+    pandoc_args: ["--lua-filter=boxes.lua"]
+geometry: "margin=2.1cm"
+fontsize: 11pt
+linkcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "##",
+                      fig.width = 8, fig.height = 3.6, fig.align = "center", out.width = "100%")
+if (knitr::is_latex_output()) knitr::opts_chunk$set(dev = "cairo_pdf", fig.pos = "H")
+```
+
+# Introduction {-}
+
+## La question {-}
+
+Les accidents de la route sont une cause majeure de décès évitables, et l'alcool y joue un grand rôle. Une politique souvent proposée consiste à **taxer davantage l'alcool**, pour réduire la consommation et donc les accidents. **Est-ce que ça marche ?**
+
+On y répond avec des **données de panel** : le taux de mortalité routière des **48 États continentaux des États-Unis**, chaque année de **1982 à 1988**, ainsi que la taxe sur la bière de chaque État. Ces données sont célèbres en économétrie (Stock et Watson, *Introduction to Econometrics*, chapitre 10). Elles illustrent parfaitement **pourquoi on a besoin des données de panel**.
+
+## Ce que le projet montre {-}
+
+1. Une analyse naïve trouve que **plus la taxe est élevée, plus il y a de morts**. C'est absurde.
+2. La raison : des **différences cachées entre États** (culture de la route, ruralité, densité de la police) qui biaisent la comparaison.
+3. Les **effets fixes**, qui comparent chaque État à lui-même dans le temps, inversent le signe.
+4. On vérifie ensuite la solidité du résultat : effets temporels, effets aléatoires, test de Hausman, variables de contrôle, écarts-types robustes, modèle mixte.
+
+Chaque notion est rappelée avant d'être utilisée (les détails sont dans le *Guide des données de panel*). Chaque ligne de code est commentée, et chaque résultat est interprété.
+
+# Les données
+
+## Charger les données et lire leur structure
+
+```{r chargement}
+library(AER)        # contient le jeu de données Fatalities (Stock & Watson)
+library(plm)        # économétrie des données de panel : pooling, within, random, tests
+library(lmtest)     # coeftest() : tableaux de coefficients avec écarts-types choisis
+library(sandwich)   # écarts-types robustes (hétéroscédasticité, grappes)
+library(lme4)       # modèles mixtes (lmer)
+data("Fatalities")                       # charge les données en mémoire
+F <- Fatalities                          # copie sous un nom court
+dim(F)                                   # nombre de lignes et de colonnes
+head(F[, c("state", "year", "fatal", "pop", "beertax")], 8)   # premières lignes des variables clés
+```
+
+**Lecture.** Il y a **336 lignes**. Chaque ligne est un couple **(État, année)** : c'est le **format long**. Les deux colonnes d'index sont `state` (l'individu) et `year` (la date).
+
+## Les variables utilisées
+
+| Variable | Signification | Varie dans le temps ? |
+|---|---|---|
+| `state`, `year` | identifiant de l'État et année | — |
+| `fatal`, `pop` | nombre de morts sur la route, population | oui |
+| `beertax` | taxe sur une caisse de bière, en dollars de 1988 | oui (rarement) |
+| `drinkage` | âge minimum légal pour boire de l'alcool | oui (certains États) |
+| `jail`, `service` | peine de prison ou travaux d'intérêt général obligatoires pour une première conduite en état d'ivresse | oui (rarement) |
+| `miles` | nombre moyen de miles parcourus par conducteur | oui |
+| `unemp` | taux de chômage (%) | oui |
+| `income` | revenu par habitant (dollars de 1987) | oui |
+
+On construit la variable étudiée, le **taux de mortalité pour 10 000 habitants**. On rapporte le nombre de morts à la population pour comparer des États de tailles très différentes.
+
+```{r variable}
+F$fr <- F$fatal / F$pop * 10000               # taux de mortalité routière pour 10 000 habitants
+summary(F[, c("fr", "beertax", "miles", "unemp", "income")])   # résumé des variables quantitatives
+```
+
+**Lecture.** En moyenne, on compte environ **`r round(mean(F$fr), 2)` morts pour 10 000 habitants** par an, avec de grands écarts entre États et années (de `r round(min(F$fr),2)` à `r round(max(F$fr),2)`). La taxe sur la bière va de `r round(min(F$beertax),2)` à `r round(max(F$beertax),2)` dollars par caisse.
+
+## Déclarer le panel
+
+```{r panel}
+p <- pdata.frame(F, index = c("state", "year"))   # déclare l'individu (state) et la date (year)
+pdim(p)                                            # dimensions : N, T, panel cylindré ou non
+```
+
+**Lecture.** Le panel est **cylindré** (*balanced*) : **N = 48 États**, **T = 7 années**, toutes observées, soit 48 × 7 = 336 lignes. C'est un **micro-panel** : beaucoup d'individus pour peu de dates.
+
+# Exploration
+
+## Les trajectoires des États
+
+```{r trajectoires, fig.height=3.8}
+par(mfrow = c(1, 2), mar = c(4, 4.2, 2.5, 1), las = 1)     # deux graphiques côte à côte
+an <- as.numeric(as.character(F$year))                      # année en numérique pour les graphiques
+plot(NA, xlim = c(1982, 1988), ylim = range(F$fr), xlab = "Année",
+     ylab = "Morts pour 10 000 hab.", main = "Mortalité routière par État")   # cadre vide
+for (s in unique(F$state)) {                               # une ligne grise par État
+  z <- F$state == s; lines(an[z], F$fr[z], col = adjustcolor("grey40", 0.4))
+}
+lines(1982:1988, tapply(F$fr, F$year, mean), col = "#D85A30", lwd = 3)        # moyenne nationale
+plot(NA, xlim = c(1982, 1988), ylim = range(F$beertax), xlab = "Année",
+     ylab = "Taxe ($ par caisse)", main = "Taxe sur la bière par État")      # cadre vide
+for (s in unique(F$state)) {                               # une ligne par État
+  z <- F$state == s; lines(an[z], F$beertax[z], col = adjustcolor("#2E6DB4", 0.5))
+}
+```
+
+**Lecture.**
+
+* **Mortalité** : les États diffèrent beaucoup de niveau, avec des écarts qui persistent d'une année sur l'autre. La moyenne nationale (orange) **baisse** sur la période (meilleure sécurité des voitures, campagnes de prévention…).
+* **Taxe** : les lignes sont presque **horizontales**. La taxe **change peu dans le temps** pour un même État. Elle diffère surtout **entre** États. C'est crucial pour la suite : les effets fixes n'utiliseront que les petits changements dans le temps.
+
+## Où se trouve l'information : « entre » ou « dans » ?
+
+```{r decomposition}
+decomp <- function(v, g) {                         # décompose la variabilité d'une variable v selon le groupe g
+  tot  <- sum((v - mean(v))^2)                     # somme des carrés totale
+  dans <- sum((v - ave(v, g))^2)                   # somme des carrés « dans » (autour de la moyenne de l'État)
+  c(part_entre = 1 - dans / tot, part_dans = dans / tot)   # parts « entre » et « dans »
+}
+round(rbind(mortalite = decomp(F$fr, F$state), taxe = decomp(F$beertax, F$state)), 3)
+```
+
+**Lecture.** Environ **`r round(100*decomp(F$beertax, F$state)[2],1)` %** seulement de la variabilité de la taxe vient de changements **dans le temps** ; le reste vient des différences **entre** États. Les effets fixes vont donc s'appuyer sur une petite part de l'information disponible. Ils seront plus justes, mais moins précis.
+
+# L'analyse naïve : une coupe transversale
+
+On commence comme si on ne disposait que **d'une seule année** : on compare les États entre eux en 1982, puis en 1988.
+
+```{r coupe}
+c82 <- lm(fr ~ beertax, data = F, subset = year == "1982")    # régression sur la seule année 1982
+c88 <- lm(fr ~ beertax, data = F, subset = year == "1988")    # régression sur la seule année 1988
+coeftest(c82, vcov = vcovHC(c82, type = "HC1"))               # coefficients 1982, écarts-types robustes
+coeftest(c88, vcov = vcovHC(c88, type = "HC1"))               # coefficients 1988, écarts-types robustes
+```
+
+```{r coupe_graph, fig.height=3.4}
+par(mfrow = c(1, 2), mar = c(4, 4.2, 2.5, 1), las = 1)
+for (a in c("1982", "1988")) {                                             # un graphique par année
+  z <- F$year == a                                                        # lignes de l'année a
+  plot(F$beertax[z], F$fr[z], pch = 19, col = "#2E6DB4", xlab = "Taxe sur la bière ($)",
+       ylab = "Morts pour 10 000 hab.", main = paste("Coupe transversale", a))
+  abline(lm(fr ~ beertax, data = F[z, ]), col = "#D85A30", lwd = 2)       # droite des moindres carrés
+}
+```
+
+**Lecture : le paradoxe.** Les deux années donnent une pente **positive** : `r round(coef(c82)[2],2)` en 1982 (non significative) et `r round(coef(c88)[2],2)` en 1988 (significative). Autrement dit, **plus la taxe est élevée, plus il y a de morts**. Pris au pied de la lettre, ce résultat dirait qu'**augmenter la taxe tue**. Ce n'est pas crédible.
+
+::: attention
+**Pourquoi ce résultat est faux : l'hétérogénéité non observée.** Les États à forte taxe (souvent dans le Sud) diffèrent des autres de bien des façons durables, qui ne sont pas mesurées : routes rurales plus dangereuses, longues distances, culture de la voiture, contrôles d'alcoolémie plus ou moins fréquents, attitude sociale envers l'alcool au volant. Ces facteurs augmentent la mortalité **et** sont associés à des taxes élevées. La régression attribue leur effet à la taxe : c'est un **biais de variable omise**.
+:::
+
+# Les MCO empilés : toutes les années ensemble
+
+**Notion.** On empile les 336 lignes et on fait une seule régression : $\text{fr}_{it}=\beta_0+\beta_1\,\text{taxe}_{it}+u_{it}$. On utilise plus de données, mais on ne corrige pas le biais.
+
+```{r pooling}
+m_pool <- plm(fr ~ beertax, data = p, model = "pooling")       # MCO empilés
+coeftest(m_pool, vcov = vcovHC(m_pool, cluster = "group", type = "HC1"))   # écarts-types robustes par État
+```
+
+**Lecture.** Le coefficient est **positif** (`r round(coef(m_pool)[2],3)`) et significatif. On retrouve le paradoxe, puisque les MCO empilés utilisent surtout la variation « entre » États, contaminée par les différences cachées. On calcule des écarts-types **par grappe (par État)** : les 7 observations d'un même État ne sont pas indépendantes.
+
+# L'idée clé : comparer chaque État à lui-même
+
+## Intuition avec deux années : « avant–après »
+
+Avant la méthode générale, voici l'idée la plus simple. On regarde **le changement** de chaque État entre 1982 et 1988 :
+$$\text{fr}_{i,1988}-\text{fr}_{i,1982}=\beta_0+\beta_1\big(\text{taxe}_{i,1988}-\text{taxe}_{i,1982}\big)+\text{erreur}.$$
+Tout ce qui est **propre à l'État et stable dans le temps** (culture, géographie…) est présent en 1982 comme en 1988. **Il s'annule dans la différence.**
+
+```{r diff8288}
+d82 <- F[F$year == "1982", ]; d88 <- F[F$year == "1988", ]     # les deux années extrêmes
+stopifnot(all(d82$state == d88$state))                           # vérifie que les États sont dans le même ordre
+dfr  <- d88$fr - d82$fr                                          # changement de mortalité de chaque État
+dtax <- d88$beertax - d82$beertax                                # changement de taxe de chaque État
+m_diff <- lm(dfr ~ dtax)                                         # régression des changements
+coeftest(m_diff, vcov = vcovHC(m_diff, type = "HC1"))            # coefficients avec écarts-types robustes
+```
+
+```{r diff_graph, fig.height=3.3}
+par(mar = c(4, 4.2, 2, 1), las = 1)
+plot(dtax, dfr, pch = 19, col = "#2E6DB4", xlab = "Changement de taxe 1982-1988 ($)",
+     ylab = "Changement de mortalité", main = "Avant–après : chaque point est un État")
+abline(m_diff, col = "#D85A30", lwd = 2); abline(h = 0, v = 0, col = "grey80")    # droite et axes
+```
+
+**Lecture.** La pente devient **négative** : `r round(coef(m_diff)[2],2)`. Les États qui ont **augmenté** leur taxe ont vu leur mortalité **baisser** davantage. En comparant chaque État à lui-même, le paradoxe disparaît. La constante (`r round(coef(m_diff)[1],3)`) reflète la baisse commune à tous les États sur la période.
+
+\newpage
+
+# Le modèle à effets fixes (toutes les années)
+
+## Le modèle
+
+$$\text{fr}_{it}=\alpha_i+\beta\,\text{taxe}_{it}+\varepsilon_{it}.$$
+
+Chaque État a **sa propre constante** $\alpha_i$, qui résume tout ce qui lui est propre et stable. On l'élimine en **centrant** chaque variable sur la moyenne de l'État (la transformation *within*), puis on estime $\beta$ sur les écarts. On utilise ainsi les 7 années, et pas seulement 1982 et 1988.
+
+```{r within}
+m_fe <- plm(fr ~ beertax, data = p, model = "within")            # effets fixes États (centrage within)
+coeftest(m_fe, vcov = vcovHC(m_fe, cluster = "group", type = "HC1"))   # écarts-types robustes par État
+```
+
+## Vérification : la même chose avec des indicatrices d'État (LSDV)
+
+```{r lsdv}
+m_lsdv <- lm(fr ~ beertax + state, data = F)          # une indicatrice par État (47 + la constante)
+coef(m_lsdv)["beertax"]                               # même coefficient que le within
+length(coef(m_lsdv))                                  # 49 coefficients : constante + taxe + 47 indicatrices
+```
+
+Les deux méthodes donnent **exactement le même coefficient** (`r round(coef(m_fe),3)`). Le within évite simplement d'afficher les 48 constantes.
+
+## Interprétation
+
+```{r interpretation}
+b <- coef(m_fe)["beertax"]                                    # effet estimé d'un dollar de taxe en plus
+sd_dans <- sd(F$beertax - ave(F$beertax, F$state))            # écart-type de la taxe « dans » les États
+c(effet_1_dollar = b,                                         # effet d'une hausse de 1 $ par caisse
+  en_pct_moyenne = 100 * b / mean(F$fr),                      # en % du taux moyen de mortalité
+  effet_hausse_typique = b * sd_dans,                         # effet d'une hausse « typique » de la taxe dans un État
+  morts_evites_par_an = -b * 0.5 * sum(F$pop[F$year == "1988"]) / 10000)   # morts évités par an pour +0,50 $ partout (pop. 1988)
+```
+
+**Lecture.**
+
+* Une hausse de la taxe de **1 dollar par caisse** est associée à **`r round(b,2)` mort pour 10 000 habitants** en moins, soit environ **`r round(-100*b/mean(F$fr))` %** du taux moyen. C'est un effet **important**.
+* Mais 1 dollar est une hausse énorme par rapport aux variations observées : dans un même État, la taxe ne varie typiquement que de `r round(sd_dans,3)` dollar. Une hausse « réaliste » de 0,50 dollar dans tous les États correspondrait à environ **`r format(round(-b*0.5*sum(F$pop[F$year=="1988"])/10000), big.mark=" ")` morts évités par an**. C'est un ordre de grandeur, pas une prévision.
+* L'écart-type par grappe est assez grand (le coefficient n'est significatif qu'au seuil de 5 %), ce qui est logique : on n'utilise que la petite part de variation de la taxe qui se produit dans le temps.
+
+## Les effets propres aux États
+
+```{r effets_etats, fig.height=3.2}
+a <- fixef(m_fe)                                             # les 48 constantes alpha_i estimées
+par(mar = c(4, 4.2, 2, 1), las = 1)
+plot(tapply(F$beertax, F$state, mean)[names(a)], a, pch = 19, col = "#2E6DB4",
+     xlab = "Taxe moyenne de l'État ($)", ylab = "Effet fixe estimé (alpha)",
+     main = "Les États à forte taxe ont un niveau de mortalité propre plus élevé")
+abline(lm(a ~ tapply(F$beertax, F$state, mean)[names(a)]), col = "#D85A30", lwd = 2)   # tendance
+```
+
+**Lecture.** Les effets fixes $\widehat\alpha_i$ sont **positivement liés à la taxe moyenne** : les États à forte taxe ont, pour d'autres raisons, une mortalité structurellement plus élevée. C'est **la preuve visuelle** du biais des MCO empilés, et la raison pour laquelle il fallait des effets fixes.
+
+## Faut-il des effets individuels ? Le test de Fisher
+
+```{r ftest}
+pFtest(m_fe, m_pool)        # H0 : toutes les constantes d'État sont égales (MCO empilés suffisants)
+```
+
+La p-valeur est quasi nulle, donc **on rejette $H_0$** : les États ont des niveaux propres très différents, et les MCO empilés ne conviennent pas.
+
+# Ajouter des effets temporels (deux dimensions)
+
+**Notion.** Certains chocs touchent **tous les États la même année** : voitures plus sûres, campagnes nationales, prix de l'essence. On les capte par un effet par année $\lambda_t$ :
+$$\text{fr}_{it}=\alpha_i+\lambda_t+\beta\,\text{taxe}_{it}+\varepsilon_{it}.$$
+
+```{r twoways}
+m_tw <- plm(fr ~ beertax, data = p, model = "within", effect = "twoways")   # effets États + années
+coeftest(m_tw, vcov = vcovHC(m_tw, cluster = "group", type = "HC1"))       # robustes par État
+pFtest(m_tw, m_fe)                                                         # H0 : pas d'effet année
+```
+
+```{r effets_annees, fig.height=3}
+lt <- fixef(m_tw, effect = "time")                     # effets année estimés (lambda_t)
+par(mar = c(4, 4.2, 2, 1), las = 1)
+plot(1982:1988, lt - lt[1], type = "b", pch = 19, col = "#2E6DB4", xlab = "Année",
+     ylab = "Écart à 1982", main = "Effets année : évolution commune à tous les États")
+abline(h = 0, lty = 2, col = "grey60")                # référence 1982
+```
+
+**Lecture.** Le coefficient de la taxe reste proche (`r round(coef(m_tw),3)`) : l'effet n'est pas dû à une tendance nationale. Les effets année montrent la **baisse commune** de la mortalité. La p-valeur du test sur les effets année est à la limite du seuil de 5 % (`r round(pFtest(m_tw, m_fe)$p.value,3)`). On les garde par prudence : ils coûtent peu et protègent contre les chocs communs.
+
+# Effets aléatoires : un modèle concurrent
+
+**Notion.** Le modèle à effets aléatoires traite l'effet de l'État comme une variable aléatoire $u_i$, **supposée non corrélée à la taxe**. Il utilise à la fois la variation « entre » et « dans ».
+
+```{r random}
+m_re <- plm(fr ~ beertax, data = p, model = "random")          # effets aléatoires (MCG, Swamy-Arora)
+coeftest(m_re, vcov = vcovHC(m_re, cluster = "group", type = "HC1"))
+m_re$ercomp$theta                                              # degré de centrage theta (0 = empilés, 1 = effets fixes)
+plmtest(m_pool, type = "bp")                                   # Breusch-Pagan : H0 = pas d'effet aléatoire
+```
+
+**Lecture.** Les effets aléatoires donnent un coefficient presque nul (`r round(coef(m_re)[2],3)`), car ils mélangent la variation « entre » (biaisée vers le haut) et la variation « dans ». Le test de Breusch-Pagan confirme qu'il existe des effets individuels. **Mais sont-ils corrélés à la taxe ?** C'est le test de Hausman qui le dit.
+
+## Le test de Hausman : effets fixes ou aléatoires ?
+
+```{r hausman}
+phtest(m_fe, m_re)      # H0 : effets individuels non corrélés à la taxe (EA convergent et efficace)
+```
+
+**Lecture.** p = `r signif(phtest(m_fe, m_re)$p.value,2)` : **on rejette $H_0$**. Les effets propres aux États sont **corrélés à la taxe**, ce qui rend les effets aléatoires biaisés. **On retient les effets fixes.** C'est exactement ce que suggérait la figure des $\widehat\alpha_i$.
+
+# Ajouter des variables de contrôle
+
+**Pourquoi ?** Les effets fixes éliminent ce qui est **stable** dans chaque État. Ce qui **change dans le temps** et peut être lié à la taxe peut encore biaiser le résultat, par exemple la conjoncture économique (on roule plus quand l'économie va bien) ou d'autres lois sur l'alcool au volant votées en même temps. On ajoute ces variables :
+
+```{r controles}
+F$drinkagec <- cut(F$drinkage, breaks = c(18, 19, 20, 21, 22), right = FALSE)   # âge légal en classes (18 = référence)
+p <- pdata.frame(F, index = c("state", "year"))                                   # on redéclare le panel avec la nouvelle variable
+m_ctrl <- plm(fr ~ beertax + drinkagec + jail + service + miles + unemp + log(income),
+              data = p, model = "within", effect = "twoways")                      # effets États + années + contrôles
+coeftest(m_ctrl, vcov = vcovHC(m_ctrl, cluster = "group", type = "HC1"))          # écarts-types robustes par État
+pdim(m_ctrl)$nT$n                                                                  # nombre d'observations utilisées
+```
+
+**Lecture.**
+
+* La **taxe** garde un coefficient négatif (`r round(coef(m_ctrl)["beertax"],2)`), mais il n'est **plus significatif**. Une partie de son effet apparent passait par la conjoncture. Le signe reste négatif, mais la preuve d'un effet propre de la taxe devient fragile.
+* Le **chômage** a un effet négatif très significatif, et le **revenu** un effet positif : quand l'économie va bien, on roule plus, et il y a plus d'accidents. Ce sont des facteurs qui changent dans le temps et que les effets fixes seuls ne captaient pas.
+* L'**âge légal** et les **peines** (prison, travaux d'intérêt général) n'ont **pas d'effet significatif** dans ce modèle.
+* Une observation manquante (Californie 1988, variables `jail` et `service`) est retirée : le panel devient légèrement non cylindré, ce que `plm` gère sans difficulté.
+
+## Tableau récapitulatif des modèles
+
+```{r recap}
+se <- function(m) sqrt(diag(vcovHC(m, cluster = "group", type = "HC1")))["beertax"]   # écart-type robuste de la taxe
+recap <- data.frame(
+  Modele = c("Coupe 1982", "Coupe 1988", "MCO empilés", "Avant–après 1982-88", "Effets fixes États",
+             "Effets fixes États + années", "Effets aléatoires", "Deux dimensions + contrôles"),
+  coef_taxe = c(coef(c82)[2], coef(c88)[2], coef(m_pool)[2], coef(m_diff)[2], coef(m_fe), coef(m_tw),
+                coef(m_re)[2], coef(m_ctrl)["beertax"]),
+  ecart_type = c(sqrt(vcovHC(c82, type = "HC1")[2, 2]), sqrt(vcovHC(c88, type = "HC1")[2, 2]), se(m_pool),
+                 sqrt(vcovHC(m_diff, type = "HC1")[2, 2]), se(m_fe), se(m_tw), se(m_re), se(m_ctrl)))
+recap$t <- recap$coef_taxe / recap$ecart_type                    # statistique t
+knitr::kable(recap, digits = 3, caption = "Coefficient de la taxe sur la bière selon le modèle (écarts-types robustes).")
+```
+
+**Lecture d'ensemble.** Les modèles qui comparent les États **entre eux** (coupes, MCO empilés) trouvent un effet **positif**, donc absurde. Ceux qui comparent chaque État **à lui-même** (avant–après, effets fixes) trouvent un effet **négatif**, d'environ −0,65. Avec les contrôles économiques, l'effet reste négatif mais devient imprécis.
+
+\newpage
+
+# Diagnostics : les écarts-types sont-ils fiables ?
+
+```{r diagnostics}
+pwartest(fr ~ beertax, data = p)                    # Wooldridge : H0 = pas d'autocorrélation des erreurs (effets fixes)
+pcdtest(m_tw, test = "cd")                          # Pesaran CD : H0 = pas de dépendance entre États
+c(usuel = coef(summary(m_fe))["beertax", 2],        # écart-type usuel du modèle à effets fixes
+  robuste_grappe = se(m_fe))                        # écart-type robuste par État
+```
+
+**Lecture.**
+
+* Le test de Wooldridge détecte une **autocorrélation** des erreurs au sein des États : les chocs persistent d'une année sur l'autre.
+* L'écart-type robuste par grappe est **nettement plus grand** que l'écart-type usuel. Avec l'écart-type usuel, on aurait surestimé la précision de l'effet. C'est pourquoi on a utilisé des écarts-types par grappe partout.
+* Le test de Pesaran (p = `r round(pcdtest(m_tw, test = "cd")$p.value,2)`) ne détecte pas de dépendance entre États une fois les effets année inclus : les écarts-types par grappe suffisent. Si cette dépendance avait été forte, on aurait utilisé des écarts-types de Driscoll-Kraay (`vcovSCC`).
+
+# Bonus : le même problème vu comme un modèle mixte
+
+**Notion.** En biostatistique, on écrirait un **modèle mixte** avec un intercept aléatoire par État. C'est l'équivalent des effets aléatoires, avec la même hypothèse d'absence de corrélation avec la taxe.
+
+```{r mixte}
+m_mix <- lmer(fr ~ beertax + year + (1 | state), data = F, REML = TRUE)   # intercept aléatoire État + effets année fixes
+fixef(m_mix)["beertax"]                                    # coefficient de la taxe
+vc <- as.data.frame(VarCorr(m_mix))                        # composantes de variance
+icc <- vc$vcov[1] / sum(vc$vcov)                           # ICC : part de la variance due aux États
+icc
+```
+
+**Lecture.** L'ICC vaut **`r round(icc,2)`** : environ `r round(100*icc)` % de la variance de la mortalité (à année donnée) vient de **différences permanentes entre États**. Le coefficient de la taxe dans le modèle mixte (`r round(fixef(m_mix)["beertax"],2)`) est proche de celui des effets aléatoires, et il est **biaisé pour la même raison** (le test de Hausman l'a montré). Le modèle mixte reste utile pour **décrire** cette variabilité entre États. Pour la question **causale**, on garde les effets fixes.
+
+# Conclusion, limites et préparation de l'entretien
+
+## Ce que montre le projet
+
+1. Comparer des États entre eux conduit à une conclusion **absurde** : la taxe augmenterait la mortalité. La cause est l'**hétérogénéité non observée** entre États.
+2. En comparant chaque État **à lui-même** (effets fixes), on obtient l'effet attendu : **−0,66 mort pour 10 000 habitants par dollar de taxe**, robuste aux effets année.
+3. Le test de **Hausman** rejette les effets aléatoires : les effets propres aux États sont corrélés à la taxe.
+4. Avec les contrôles économiques, l'effet reste **négatif** mais devient **non significatif**. La preuve d'un effet propre de la taxe est donc **suggestive, pas définitive**.
+
+## Limites
+
+* La taxe **varie peu** dans le temps au sein d'un État : les estimations sont imprécises.
+* Les effets fixes n'éliminent que les facteurs **stables**. Une loi ou une campagne locale votée en même temps qu'une hausse de taxe pourrait encore biaiser le résultat.
+* La période est courte (7 ans) et ancienne (1982-1988).
+* La mortalité est un **taux construit à partir de comptages**. Un modèle de Poisson à effets fixes, avec la population en *offset*, serait une extension naturelle.
+
+## Phrase possible pour une lettre de motivation
+
+> Dans un travail personnel sur données de panel (48 États américains, 1982-1988), j'ai évalué l'effet des taxes sur l'alcool sur la mortalité routière : j'ai montré que des modèles à effets fixes, choisis par un test de Hausman et estimés avec des écarts-types robustes par grappe, corrigeaient un biais d'hétérogénéité non observée qui inversait le signe de l'effet.
+
+## Questions probables en entretien
+
+| Question | Réponse courte |
+|---|---|
+| Pourquoi la régression simple trouve-t-elle un effet positif ? | Biais de variable omise : les États à forte taxe ont, pour d'autres raisons, une mortalité structurellement élevée. |
+| Que font les effets fixes ? | Ils comparent chaque État à lui-même dans le temps, ce qui élimine tout ce qui est propre à l'État et stable. |
+| Pourquoi pas des effets aléatoires ? | Le test de Hausman rejette (p ≈ 2 × 10⁻⁵) : les effets propres aux États sont corrélés à la taxe. |
+| Pourquoi des écarts-types par grappe ? | Les erreurs d'un même État sont autocorrélées (test de Wooldridge) ; les écarts-types usuels sous-estiment l'incertitude. |
+| Que devient l'effet avec des contrôles ? | Il reste négatif (−0,45) mais n'est plus significatif : la conjoncture explique une partie de l'effet apparent. |
+| Quelle limite principale ? | Peu de variation de la taxe dans le temps, et des facteurs variables dans le temps non contrôlés. |
+
+## Pour aller plus loin
+
+* Un **Poisson à effets fixes** (`fixest::fepois`) sur les nombres de morts, avec la population en *offset*.
+* Une **analyse par tranche d'âge** (variables `fatal1820`, `fatal2124`) : les jeunes conducteurs réagissent-ils plus à la taxe ?
+* Un **événement** (*event study*) autour des changements d'âge légal pour boire.
